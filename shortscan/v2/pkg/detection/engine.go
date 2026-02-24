@@ -460,7 +460,9 @@ func (de *DetectionEngine) enumerateFileName(
 			continue
 		}
 		drainAndClose(resp.Body)
-		if resp.StatusCode == detResult.StatusNeg {
+		// Exact match: only the same statusPos seen during detection counts as a hit.
+		// Checking != statusNeg causes false-positives → runaway recursion → very slow scan.
+		if resp.StatusCode != detResult.StatusPos {
 			continue
 		}
 
@@ -510,7 +512,7 @@ func (de *DetectionEngine) enumerateExtension(
 			continue
 		}
 		drainAndClose(resp.Body)
-		if resp.StatusCode == detResult.StatusNeg {
+		if resp.StatusCode != detResult.StatusPos {
 			continue
 		}
 
