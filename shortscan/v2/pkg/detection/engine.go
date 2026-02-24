@@ -363,9 +363,13 @@ func (de *DetectionEngine) discoverCharacters(
 
 				var testURL string
 				if isFileName {
-					testURL = fmt.Sprintf("%s*%c*%s*", baseURL, charVal, tildeVal)
+					// Does any file in baseURL start with charVal and match tildeVal?
+					// IIS pattern: /baseDir/C*~N*
+					testURL = fmt.Sprintf("%s%c*%s*", baseURL, charVal, tildeVal)
 				} else {
-					testURL = fmt.Sprintf("%s*%s*%c*", baseURL, tildeVal, charVal)
+					// Does any short-named file have an extension starting with charVal?
+					// IIS pattern: /baseDir/*~N.C*
+					testURL = fmt.Sprintf("%s*%s.%c*", baseURL, tildeVal, charVal)
 				}
 
 				resp, err := de.httpEngine.Request(ctx, detResult.Method, testURL, nil)
@@ -414,6 +418,9 @@ func (de *DetectionEngine) discoverCharacters(
 
 // EnumerateFiles performs full file/directory enumeration using the detection result.
 func (de *DetectionEngine) EnumerateFiles(ctx context.Context, baseURL string, detResult *DetectionResult) ([]FileInfo, error) {
+	// Normalise baseURL to always end with '/' so all URL patterns are correct.
+	baseURL = strings.TrimSuffix(baseURL, "/") + "/"
+
 	chars := de.cfg.Characters
 
 	fileChars := de.discoverCharacters(ctx, baseURL, chars, detResult, true)
