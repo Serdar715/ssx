@@ -26,8 +26,10 @@ type DetectionResult struct {
 	Confidence float64 `json:"confidence"`
 	// DetectionMode is the algorithm used (e.g. "status", "method").
 	DetectionMode string `json:"detection_mode"`
-	// Method is the HTTP method (verb) that triggered the vulnerability (e.g. "OPTIONS").
-	Method        string        `json:"method"`
+	// Method is the HTTP verb that triggered the match (e.g. "OPTIONS").
+	Method string `json:"method"`
+	// Suffix is the path suffix used to trigger the response difference (e.g. ".aspx").
+	Suffix        string        `json:"suffix"`
 	StatusPos     int           `json:"status_pos"`
 	StatusNeg     int           `json:"status_neg"`
 	Tildes        []string      `json:"tildes"`
@@ -206,6 +208,9 @@ outerLoop:
 				// Store the actual HTTP verb that worked so enumeration
 				// can reuse it instead of using the detection mode name.
 				result.Method = method
+				// Store the suffix so enumeration uses the same URL shape
+				// that triggered the detectable status difference.
+				result.Suffix = suffix
 
 				if de.cfg.VulnCheckOnly {
 					break outerLoop
@@ -363,12 +368,12 @@ func (de *DetectionEngine) discoverCharacters(
 
 				var testURL string
 				if isFileName {
-					// Does any file in baseURL start with charVal and match tildeVal?
-					// IIS pattern: /baseDir/C*~N*
-					testURL = fmt.Sprintf("%s%c*%s*", baseURL, charVal, tildeVal)
+					// Does any file starting with charVal match tildeVal?
+					// Use the same URL suffix that was used during detection.
+					testURL = fmt.Sprintf("%s%c*%s*%s", baseURL, charVal, tildeVal, detResult.Suffix)
 				} else {
-					// Does any short-named file have an extension starting with charVal?
-					// IIS pattern: /baseDir/*~N.C*
+					// Extension discovery: does any ~N file have an ext starting with charVal?
+					// Suffix not applicable here; the IIS pattern is *~N.C*
 					testURL = fmt.Sprintf("%s*%s.%c*", baseURL, tildeVal, charVal)
 				}
 
@@ -459,12 +464,14 @@ func (de *DetectionEngine) enumerateRecursive(
 			newFile = file + string(char)
 		}
 
-		// Build the probe URL — the HTTP method is NOT part of the URL path.
+		// Build the probe URL — use the same suffix that triggered detection.
 		var testURL string
 		if inExtMode {
+			// Extension mode: *~N.EXT* — no path suffix needed here.
 			testURL = fmt.Sprintf("%s%s%s%s*", baseURL, newFile, tilde, newExt)
 		} else {
-			testURL = fmt.Sprintf("%s%s*%s*", baseURL, newFile, tilde)
+			// File mode: match beginning of 8.3 name — apply detection suffix.
+			testURL = fmt.Sprintf("%s%s*%s*%s", baseURL, newFile, tilde, detResult.Suffix)
 		}
 
 		resp, err := de.httpEngine.Request(ctx, detResult.Method, testURL, nil)
