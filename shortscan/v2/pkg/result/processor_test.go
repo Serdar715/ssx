@@ -6,9 +6,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/bitquark/shortscan/v2/pkg/config"
-	"github.com/bitquark/shortscan/v2/pkg/detection"
-	"github.com/bitquark/shortscan/v2/pkg/result"
+	"github.com/Serdar715/ssx/shortscan/v2/pkg/config"
+	"github.com/Serdar715/ssx/shortscan/v2/pkg/detection"
+	"github.com/Serdar715/ssx/shortscan/v2/pkg/result"
 )
 
 // newTestResult returns a minimal ScanResult for use in tests.

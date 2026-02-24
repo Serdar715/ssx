@@ -19,9 +19,9 @@ import (
 	"github.com/fatih/color"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/bitquark/shortscan/v2/pkg/api"
-	"github.com/bitquark/shortscan/v2/pkg/config"
-	"github.com/bitquark/shortscan/v2/pkg/scanner"
+	"github.com/Serdar715/ssx/shortscan/v2/pkg/api"
+	"github.com/Serdar715/ssx/shortscan/v2/pkg/config"
+	"github.com/Serdar715/ssx/shortscan/v2/pkg/scanner"
 )
 
 // CommandLineArgs represents command line arguments.

@@ -15,9 +15,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bitquark/shortscan/v2/pkg/config"
-	"github.com/bitquark/shortscan/v2/pkg/httpengine"
-	"github.com/bitquark/shortscan/v2/pkg/levenshtein"
+	"github.com/Serdar715/ssx/shortscan/v2/pkg/config"
+	"github.com/Serdar715/ssx/shortscan/v2/pkg/httpengine"
+	"github.com/Serdar715/ssx/shortscan/v2/pkg/levenshtein"
 )
 
 // DetectionResult represents the result of a vulnerability detection pass.

@@ -16,10 +16,10 @@ import (
 
 	"github.com/fatih/color"
 
-	"github.com/bitquark/shortscan/v2/pkg/config"
-	"github.com/bitquark/shortscan/v2/pkg/detection"
-	"github.com/bitquark/shortscan/v2/pkg/httpengine"
-	"github.com/bitquark/shortscan/v2/pkg/result"
+	"github.com/Serdar715/ssx/shortscan/v2/pkg/config"
+	"github.com/Serdar715/ssx/shortscan/v2/pkg/detection"
+	"github.com/Serdar715/ssx/shortscan/v2/pkg/httpengine"
+	"github.com/Serdar715/ssx/shortscan/v2/pkg/result"
 )
 
 // Scanner is the main scanner orchestrator.

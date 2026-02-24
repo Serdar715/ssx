@@ -1,4 +1,4 @@
-module github.com/bitquark/shortscan/v2
+module github.com/Serdar715/ssx/shortscan/v2
 
 go 1.21
 

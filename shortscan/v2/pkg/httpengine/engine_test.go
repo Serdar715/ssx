@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitquark/shortscan/v2/pkg/config"
-	"github.com/bitquark/shortscan/v2/pkg/httpengine"
+	"github.com/Serdar715/ssx/shortscan/v2/pkg/config"
+	"github.com/Serdar715/ssx/shortscan/v2/pkg/httpengine"
 )
 
 // TestProxyManagerRoundRobin verifies that GetProxy cycles through all proxies.
