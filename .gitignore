@@ -1,0 +1,35 @@
+# Binaries & Build Artifacts
+/bin/
+/shortscan/shortscan
+/shortscan/shortscan.exe
+/shortscan/shortutil
+/shortscan/shortutil.exe
+
+# Dependency Management
+/vendor/
+go.work.sum
+
+# Research & Private Data (STRICTLY EXCLUDED)
+*.pdf
+*.docx
+*.pptx
+*.xlsx
+*.doc
+.qoder/
+research/
+reports/
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# IDEs & Editor Configuration
+.idea/
+.vscode/
+*.swp
+*.swo
+.project
+.settings/
+.classpath
