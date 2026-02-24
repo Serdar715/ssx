@@ -6,6 +6,7 @@
 package httpengine
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,7 +24,8 @@ import (
 	"golang.org/x/net/http2"
 )
 
-// Stats holds HTTP statistics
+// Stats holds HTTP statistics.
+// All fields are protected by the engine mutex; do NOT mix atomic ops on these fields.
 type Stats struct {
 	TotalRequests   int64
 	SuccessRequests int64
@@ -35,15 +38,15 @@ type Stats struct {
 	MaxLatency      time.Duration
 }
 
-// ProxyManager handles proxy rotation
+// ProxyManager handles proxy rotation with a dedicated read-write mutex.
 type ProxyManager struct {
 	proxies    []string
-	current    int32
-	mu         sync.RWMutex
-	badProxies map[string]int // proxy -> failure count
+	current    int
+	badProxies map[string]int // proxy → consecutive failure count
+	mu         sync.Mutex
 }
 
-// NewProxyManager creates a new proxy manager
+// NewProxyManager creates a new proxy manager from a list of proxy URLs.
 func NewProxyManager(proxies []string) *ProxyManager {
 	return &ProxyManager{
 		proxies:    proxies,
@@ -51,165 +54,159 @@ func NewProxyManager(proxies []string) *ProxyManager {
 	}
 }
 
-// GetProxy returns the next available proxy
+// GetProxy returns the next non-bad proxy using round-robin selection.
+// If all proxies are bad the failure counters are reset and the first proxy is returned.
 func (pm *ProxyManager) GetProxy() string {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
 	if len(pm.proxies) == 0 {
 		return ""
 	}
-	
-	pm.mu.RLock()
-	defer pm.mu.RUnlock()
-	
-	// Try to find a working proxy
-	for i := 0; i < len(pm.proxies); i++ {
-		idx := atomic.AddInt32(&pm.current, 1) % int32(len(pm.proxies))
-		proxy := pm.proxies[idx]
-		
-		// Skip bad proxies (more than 3 failures)
-		if pm.badProxies[proxy] < 3 {
+
+	// Try each proxy in order, skipping bad ones.
+	for range pm.proxies {
+		pm.current = (pm.current + 1) % len(pm.proxies)
+		proxy := pm.proxies[pm.current]
+		if pm.badProxies[proxy] < config.ProxyMaxFailures {
 			return proxy
 		}
 	}
-	
-	// If all proxies are bad, reset and return first
+
+	// All proxies exceeded failure threshold — reset and fall back to first.
+	pm.badProxies = make(map[string]int)
 	pm.current = 0
 	return pm.proxies[0]
 }
 
-// MarkBad marks a proxy as bad
-func (pm *ProxyManager) MarkBad(proxy string) {
+// MarkBad records a failure for the given proxy URL.
+func (pm *ProxyManager) MarkBad(proxyURL string) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
-	pm.badProxies[proxy]++
+	pm.badProxies[proxyURL]++
 }
 
-// RateLimiter implements adaptive rate limiting
+// RateLimiter implements an adaptive token-bucket rate limiter.
+// The mutex is held only while reading/writing token state, not during sleeps.
 type RateLimiter struct {
-	rate      int
-	burst     int
-	tokens    int
-	lastCheck time.Time
-	mu        sync.Mutex
-	
-	// Adaptive rate limiting
-	successCount int
-	failCount    int
+	mu           sync.Mutex
+	tokens       int
+	lastCheck    time.Time
 	currentRate  int
+	burst        int
 	minRate      int
 	maxRate      int
+	successCount int
+	failCount    int
 }
 
-// NewRateLimiter creates a new rate limiter
+// NewRateLimiter creates a new rate limiter with the given rate and burst values.
 func NewRateLimiter(rate, burst int) *RateLimiter {
 	return &RateLimiter{
-		rate:       rate,
-		burst:      burst,
-		tokens:     burst,
-		lastCheck:  time.Now(),
+		tokens:      burst,
+		lastCheck:   time.Now(),
 		currentRate: rate,
-		minRate:    rate / 10,
-		maxRate:    rate * 2,
+		burst:       burst,
+		minRate:     max(1, rate/10),
+		maxRate:     rate * 2,
 	}
 }
 
-// Wait blocks until a token is available
-func (rl *RateLimiter) Wait(ctx context.Context) error {
+// Wait blocks until a token is available or the context is cancelled.
+// The mutex is NOT held during the sleep, so other goroutines are not blocked.
+func (rl *RateLimiter) Wait(waitCtx context.Context) error {
+	// Refill tokens outside the lock to calculate wait duration.
 	rl.mu.Lock()
-	defer rl.mu.Unlock()
-	
 	now := time.Now()
 	elapsed := now.Sub(rl.lastCheck)
 	rl.lastCheck = now
-	
-	// Add tokens based on elapsed time
 	tokensToAdd := int(elapsed.Seconds() * float64(rl.currentRate))
 	rl.tokens = min(rl.burst, rl.tokens+tokensToAdd)
-	
+
 	if rl.tokens > 0 {
 		rl.tokens--
+		rl.mu.Unlock()
 		return nil
 	}
-	
-	// Wait for next token
-	waitTime := time.Second / time.Duration(rl.currentRate)
+
+	// Calculate how long we need to wait for one token.
+	waitDuration := time.Second / time.Duration(rl.currentRate)
+	rl.mu.Unlock()
+
+	// Sleep without holding the lock.
 	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(waitTime):
+	case <-waitCtx.Done():
+		return waitCtx.Err()
+	case <-time.After(waitDuration):
 		return nil
 	}
 }
 
-// RecordSuccess records a successful request for adaptive rate limiting
+// RecordSuccess records a successful request and may increase the rate.
 func (rl *RateLimiter) RecordSuccess() {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
-	
+
 	rl.successCount++
-	
-	// Increase rate after 10 successes
-	if rl.successCount >= 10 {
-		rl.currentRate = min(rl.maxRate, rl.currentRate+10)
+	if rl.successCount >= config.AdaptiveSuccessThreshold {
+		rl.currentRate = min(rl.maxRate, rl.currentRate+config.AdaptiveRateIncrement)
 		rl.successCount = 0
 	}
 }
 
-// RecordFailure records a failed request for adaptive rate limiting
+// RecordFailure records a failed request and may decrease the rate.
 func (rl *RateLimiter) RecordFailure() {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
-	
+
 	rl.failCount++
-	
-	// Decrease rate after 3 failures
-	if rl.failCount >= 3 {
-		rl.currentRate = max(rl.minRate, rl.currentRate-20)
+	if rl.failCount >= config.AdaptiveFailureThreshold {
+		rl.currentRate = max(rl.minRate, rl.currentRate-config.AdaptiveRateDecrement)
 		rl.failCount = 0
 	}
 }
 
-// HTTPEngine is the advanced HTTP client
+// HTTPEngine is the advanced HTTP client with connection pooling and proxy rotation.
 type HTTPEngine struct {
-	config        *config.ScanConfig
-	client        *http.Client
-	clientPool    []*http.Client
-	poolIndex     int32
-	proxyManager  *ProxyManager
-	rateLimiter   *RateLimiter
-	stats         Stats
-	mu            sync.RWMutex
-	latencies     []time.Duration
+	cfg          *config.ScanConfig
+	clientPool   []*http.Client
+	poolIndex    atomic.Int32
+	proxyManager *ProxyManager
+	rateLimiter  *RateLimiter
+
+	mu        sync.Mutex // protects stats and latencies
+	stats     Stats
+	latencies []time.Duration
 }
 
-// NewHTTPEngine creates a new HTTP engine
+// NewHTTPEngine creates a new HTTP engine configured from cfg.
 func NewHTTPEngine(cfg *config.ScanConfig) *HTTPEngine {
 	engine := &HTTPEngine{
-		config:      cfg,
+		cfg:         cfg,
 		rateLimiter: NewRateLimiter(cfg.RateLimit, cfg.RateLimitBurst),
-		latencies:   make([]time.Duration, 0, 1000),
+		latencies:   make([]time.Duration, 0, config.TimingSampleWindow),
 	}
-	
-	// Setup proxy manager if configured
+
+	// Setup proxy manager if configured.
 	if cfg.ProxyFile != "" || cfg.ProxyURL != "" {
 		proxies := loadProxies(cfg)
 		engine.proxyManager = NewProxyManager(proxies)
 	}
-	
-	// Create connection pool with multiple clients
+
+	// Create connection pool with one client per concurrency slot.
 	engine.clientPool = make([]*http.Client, cfg.Concurrency)
-	for i := 0; i < cfg.Concurrency; i++ {
-		engine.clientPool[i] = engine.createClient()
+	for idx := range engine.clientPool {
+		engine.clientPool[idx] = engine.createClient()
 	}
-	engine.client = engine.clientPool[0]
-	
+
 	return engine
 }
 
-// createClient creates an HTTP client with proper configuration
+// createClient creates an HTTP client with proper configuration.
 func (e *HTTPEngine) createClient() *http.Client {
 	transport := &http.Transport{
 		DialContext: (&net.Dialer{
-			Timeout:   e.config.ConnectTimeout,
+			Timeout:   e.cfg.ConnectTimeout,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 		MaxIdleConns:          100,
@@ -219,136 +216,134 @@ func (e *HTTPEngine) createClient() *http.Client {
 		MaxIdleConnsPerHost:   20,
 		DisableCompression:    false,
 		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: e.config.TLSSkipVerify,
+			InsecureSkipVerify: e.cfg.TLSSkipVerify, //nolint:gosec // user-controlled option
 			Renegotiation:      tls.RenegotiateOnceAsClient,
 		},
 		Proxy: e.getProxyFunc(),
 	}
-	
-	// Enable HTTP/2
-	if e.config.EnableHTTP2 {
-		http2.ConfigureTransport(transport)
+
+	if e.cfg.EnableHTTP2 {
+		http2.ConfigureTransport(transport) //nolint:errcheck // best-effort HTTP/2 upgrade
 	}
-	
+
 	return &http.Client{
 		Transport: transport,
-		Timeout:   e.config.Timeout,
+		Timeout:   e.cfg.Timeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if !e.config.FollowRedirect {
+			if !e.cfg.FollowRedirect {
 				return http.ErrUseLastResponse
 			}
-			if len(via) >= e.config.MaxRedirects {
-				return fmt.Errorf("stopped after %d redirects", e.config.MaxRedirects)
+			if len(via) >= e.cfg.MaxRedirects {
+				return fmt.Errorf("stopped after %d redirects", e.cfg.MaxRedirects)
 			}
 			return nil
 		},
 	}
 }
 
-// getProxyFunc returns the proxy function
+// getProxyFunc returns the proxy selector function for http.Transport.
 func (e *HTTPEngine) getProxyFunc() func(*http.Request) (*url.URL, error) {
 	return func(req *http.Request) (*url.URL, error) {
 		if e.proxyManager == nil {
 			return http.ProxyFromEnvironment(req)
 		}
-		
-		proxy := e.proxyManager.GetProxy()
-		if proxy == "" {
+
+		proxyStr := e.proxyManager.GetProxy()
+		if proxyStr == "" {
 			return http.ProxyFromEnvironment(req)
 		}
-		
-		proxyURL, err := url.Parse(proxy)
+
+		proxyURL, err := url.Parse(proxyStr)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("invalid proxy URL %q: %w", proxyStr, err)
 		}
-		
-		// Add auth if configured
-		if e.config.ProxyAuth != "" {
-			proxyURL.User, _ = url.ParseUserinfo(e.config.ProxyAuth)
+
+		if e.cfg.ProxyAuth != "" {
+			username, password, _ := strings.Cut(e.cfg.ProxyAuth, ":")
+			if password != "" {
+				proxyURL.User = url.UserPassword(username, password)
+			} else {
+				proxyURL.User = url.User(username)
+			}
 		}
-		
+
 		return proxyURL, nil
 	}
 }
 
-// Request performs an HTTP request with retry logic
-func (e *HTTPEngine) Request(ctx context.Context, method, url string, headers map[string]string) (*http.Response, error) {
-	return e.RequestWithRetry(ctx, method, url, headers, e.config.RetryCount)
+// Request performs an HTTP request using the configured retry count.
+// The caller is responsible for draining and closing resp.Body.
+func (e *HTTPEngine) Request(ctx context.Context, method, rawURL string, headers map[string]string) (*http.Response, error) {
+	return e.RequestWithRetry(ctx, method, rawURL, headers, e.cfg.RetryCount)
 }
 
-// RequestSimple performs a simple HTTP request without custom headers
-func (e *HTTPEngine) RequestSimple(ctx context.Context, method, urlStr string) (*http.Response, error) {
-	return e.Request(ctx, method, urlStr, nil)
-}
-
-// RequestWithRetry performs an HTTP request with custom retry count
-func (e *HTTPEngine) RequestWithRetry(ctx context.Context, method, url string, headers map[string]string, maxRetries int) (*http.Response, error) {
+// RequestWithRetry performs an HTTP request with a custom retry count.
+// The caller is responsible for draining and closing resp.Body.
+func (e *HTTPEngine) RequestWithRetry(ctx context.Context, method, rawURL string, headers map[string]string, maxRetries int) (*http.Response, error) {
 	var lastErr error
-	var resp *http.Response
-	
+
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		// Rate limiting
+		// Respect rate limit.
 		if err := e.rateLimiter.Wait(ctx); err != nil {
 			return nil, err
 		}
-		
-		// Create request
-		req, err := http.NewRequestWithContext(ctx, method, url, nil)
+
+		req, err := http.NewRequestWithContext(ctx, method, rawURL, nil)
 		if err != nil {
-			return nil, err
+			// Malformed URL is not retryable.
+			return nil, fmt.Errorf("build request: %w", err)
 		}
-		
-		// Set headers
-		req.Header.Set("User-Agent", e.config.UserAgent)
+
+		req.Header.Set("User-Agent", e.cfg.UserAgent)
+
 		for k, v := range headers {
 			req.Header.Set(k, v)
 		}
-		
-		// Parse and set custom headers from config
-		for _, h := range e.config.Headers {
+
+		for _, h := range e.cfg.Headers {
 			parts := strings.SplitN(h, ":", 2)
 			if len(parts) == 2 {
-				if strings.ToLower(strings.TrimSpace(parts[0])) == "host" {
-					req.Host = strings.TrimSpace(parts[1])
+				key := strings.TrimSpace(parts[0])
+				val := strings.TrimSpace(parts[1])
+				if strings.EqualFold(key, "host") {
+					req.Host = val
 				} else {
-					req.Header.Set(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
+					req.Header.Set(key, val)
 				}
 			}
 		}
-		
-		// Set cookies
-		for _, c := range e.config.Cookies {
-			req.Header.Add("Cookie", c)
+
+		for _, cookie := range e.cfg.Cookies {
+			req.Header.Add("Cookie", cookie)
 		}
-		
-		// Get client from pool
-		clientIdx := atomic.AddInt32(&e.poolIndex, 1) % int32(len(e.clientPool))
-		client := e.clientPool[clientIdx]
-		
-		// Execute request
+
+		idx := int(e.poolIndex.Add(1)) % len(e.clientPool)
+		client := e.clientPool[idx]
+
 		start := time.Now()
-		resp, lastErr = client.Do(req)
+		resp, doErr := client.Do(req)
 		latency := time.Since(start)
-		
-		// Update stats
-		e.updateStats(latency, resp, lastErr)
-		
-		if lastErr == nil {
+
+		e.updateStats(latency, resp, doErr)
+
+		if doErr == nil {
 			e.rateLimiter.RecordSuccess()
 			return resp, nil
 		}
-		
-		// Mark proxy as bad if using proxy rotation
+
+		lastErr = doErr
+
 		if e.proxyManager != nil {
-			e.proxyManager.MarkBad(e.proxyManager.GetProxy())
+			// Mark the proxy that was in use as bad.
+			if proxy := e.proxyManager.GetProxy(); proxy != "" {
+				e.proxyManager.MarkBad(proxy)
+			}
 		}
-		
+
 		e.rateLimiter.RecordFailure()
-		atomic.AddInt64(&e.stats.Retries, 1)
-		
-		// Exponential backoff
+
 		if attempt < maxRetries-1 {
-			backoff := e.config.RetryDelay * time.Duration(math.Pow(2, float64(attempt)))
+			backoff := e.cfg.RetryDelay * time.Duration(math.Pow(2, float64(attempt)))
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
@@ -356,37 +351,40 @@ func (e *HTTPEngine) RequestWithRetry(ctx context.Context, method, url string, h
 			}
 		}
 	}
-	
-	return resp, lastErr
+
+	return nil, lastErr
 }
 
-// updateStats updates HTTP statistics
+// updateStats updates HTTP statistics under the engine mutex.
 func (e *HTTPEngine) updateStats(latency time.Duration, resp *http.Response, err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	
-	atomic.AddInt64(&e.stats.TotalRequests, 1)
-	
+
+	e.stats.TotalRequests++
+
 	if err != nil {
-		atomic.AddInt64(&e.stats.FailedRequests, 1)
+		e.stats.FailedRequests++
 	} else {
-		atomic.AddInt64(&e.stats.SuccessRequests, 1)
+		e.stats.SuccessRequests++
+
+		if resp != nil {
+			e.stats.BytesReceived += resp.ContentLength
+		}
 	}
-	
-	// Track latencies
+
+	// Rolling latency window.
 	e.latencies = append(e.latencies, latency)
-	if len(e.latencies) > 100 {
+	if len(e.latencies) > config.TimingSampleWindow {
 		e.latencies = e.latencies[1:]
 	}
-	
-	// Calculate average
+
+	// Recalculate average.
 	var total time.Duration
 	for _, l := range e.latencies {
 		total += l
 	}
 	e.stats.AvgLatency = total / time.Duration(len(e.latencies))
-	
-	// Min/Max
+
 	if e.stats.MinLatency == 0 || latency < e.stats.MinLatency {
 		e.stats.MinLatency = latency
 	}
@@ -395,37 +393,64 @@ func (e *HTTPEngine) updateStats(latency time.Duration, resp *http.Response, err
 	}
 }
 
-// GetStats returns current statistics
+// GetStats returns a snapshot of the current HTTP statistics.
 func (e *HTTPEngine) GetStats() Stats {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	return e.stats
 }
 
-// loadProxies loads proxies from configuration
+// RecordRetry increments the retry counter; called by callers that implement their own retry logic.
+func (e *HTTPEngine) RecordRetry() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.stats.Retries++
+}
+
+// loadProxies loads proxy URLs from the configuration.
+// If ProxyURL is set it is added first; if ProxyFile is set every non-empty,
+// non-comment line in the file is treated as a proxy URL.
 func loadProxies(cfg *config.ScanConfig) []string {
 	proxies := make([]string, 0)
-	
+
 	if cfg.ProxyURL != "" {
 		proxies = append(proxies, cfg.ProxyURL)
 	}
-	
-	// TODO: Load from file if ProxyFile is set
-	
+
+	if cfg.ProxyFile != "" {
+		fileProxies, err := readLinesFromFile(cfg.ProxyFile)
+		if err != nil {
+			// Non-fatal: log and continue with whatever we have.
+			fmt.Fprintf(os.Stderr, "[WARN] proxy file %q: %v\n", cfg.ProxyFile, err)
+		} else {
+			proxies = append(proxies, fileProxies...)
+		}
+	}
+
 	return proxies
 }
 
-// Helper functions
-func min(a, b int) int {
-	if a < b {
-		return a
+// readLinesFromFile reads a text file and returns non-empty, non-comment lines.
+func readLinesFromFile(filePath string) ([]string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("open %q: %w", filePath, err)
 	}
-	return b
-}
+	defer file.Close()
 
-func max(a, b int) int {
-	if a > b {
-		return a
+	lines := make([]string, 0)
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		lines = append(lines, line)
 	}
-	return b
+
+	if scanErr := scanner.Err(); scanErr != nil {
+		return nil, fmt.Errorf("read %q: %w", filePath, scanErr)
+	}
+
+	return lines, nil
 }

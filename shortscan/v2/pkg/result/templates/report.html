@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Shortscan v2 - Scan Results</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background: #1a1a2e; color: #eee; }
+        .vulnerable { color: #ff6b6b; }
+        .safe { color: #4ecdc4; }
+        .file { color: #ffd93d; }
+        table { border-collapse: collapse; width: 100%; margin-top: 20px; }
+        th, td { border: 1px solid #333; padding: 10px; text-align: left; }
+        th { background: #16213e; }
+    </style>
+</head>
+<body>
+    <h1>🌀 Shortscan v2 - Scan Results</h1>
+    <div class="target">
+        <h2>Target: {{.TargetURL}}</h2>
+        <p>Server: {{.ServerInfo}}</p>
+        <p>Vulnerable:
+            {{if .Vulnerable}}
+                <span class="vulnerable">YES</span>
+            {{else}}
+                <span class="safe">NO</span>
+            {{end}}
+        </p>
+    </div>
+    {{if .Vulnerable}}
+    <div class="files">
+        <h3>Discovered Files ({{len .FilesDiscovered}})</h3>
+        <table>
+            <tr><th>Short Name</th><th>Full Name</th><th>Confidence</th></tr>
+            {{range .FilesDiscovered}}
+            <tr>
+                <td class="file">{{.ShortName}}</td>
+                <td>{{.FullName}}</td>
+                <td>{{printf "%.2f" .Confidence}}</td>
+            </tr>
+            {{end}}
+        </table>
+    </div>
+    {{end}}
+    <div class="stats">
+        <h3>Statistics</h3>
+        <p>Duration: {{.Duration}}</p>
+        <p>Total Requests: {{.Statistics.TotalRequests}}</p>
+    </div>
+</body>
+</html>

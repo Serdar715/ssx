@@ -6,6 +6,7 @@
 package result
 
 import (
+	_ "embed"
 	"encoding/csv"
 	"encoding/json"
 	"encoding/xml"
@@ -17,11 +18,16 @@ import (
 	"sync"
 	"time"
 
+	log "github.com/sirupsen/logrus"
+
 	"github.com/bitquark/shortscan/v2/pkg/config"
 	"github.com/bitquark/shortscan/v2/pkg/detection"
 )
 
-// CVSSScore represents CVSS scoring information
+//go:embed templates/report.html
+var htmlReportTemplate string
+
+// CVSSScore represents CVSS scoring information.
 type CVSSScore struct {
 	Vector      string  `json:"vector"`
 	BaseScore   float64 `json:"base_score"`
@@ -30,36 +36,36 @@ type CVSSScore struct {
 	Description string  `json:"description"`
 }
 
-// VulnerabilityInfo represents comprehensive vulnerability information
+// VulnerabilityInfo represents comprehensive vulnerability information.
 type VulnerabilityInfo struct {
-	ID              string           `json:"id"`
-	CVE             string           `json:"cve,omitempty"`
-	Name            string           `json:"name"`
-	Description     string           `json:"description"`
-	CVSS            CVSSScore        `json:"cvss"`
-	FilesExposed    []detection.FileInfo `json:"files_exposed"`
-	Directories     []string         `json:"directories,omitempty"`
-	Remediation     string           `json:"remediation"`
-	References      []string         `json:"references,omitempty"`
-	DiscoveredAt    time.Time        `json:"discovered_at"`
-	TargetURL       string           `json:"target_url"`
-	Confidence      float64          `json:"confidence"`
+	ID           string               `json:"id"`
+	CVE          string               `json:"cve,omitempty"`
+	Name         string               `json:"name"`
+	Description  string               `json:"description"`
+	CVSS         CVSSScore            `json:"cvss"`
+	FilesExposed []detection.FileInfo `json:"files_exposed"`
+	Directories  []string             `json:"directories,omitempty"`
+	Remediation  string               `json:"remediation"`
+	References   []string             `json:"references,omitempty"`
+	DiscoveredAt time.Time            `json:"discovered_at"`
+	TargetURL    string               `json:"target_url"`
+	Confidence   float64              `json:"confidence"`
 }
 
-// ScanResult represents the complete scan result
+// ScanResult represents the complete scan result for a single target.
 type ScanResult struct {
-	TargetURL       string              `json:"target_url"`
-	ServerInfo      string              `json:"server_info"`
-	Vulnerable      bool                `json:"vulnerable"`
-	Vulnerabilities []VulnerabilityInfo `json:"vulnerabilities"`
+	TargetURL       string               `json:"target_url"`
+	ServerInfo      string               `json:"server_info"`
+	Vulnerable      bool                 `json:"vulnerable"`
+	Vulnerabilities []VulnerabilityInfo  `json:"vulnerabilities"`
 	FilesDiscovered []detection.FileInfo `json:"files_discovered"`
-	Statistics      ScanStatistics      `json:"statistics"`
-	StartTime       time.Time           `json:"start_time"`
-	EndTime         time.Time           `json:"end_time"`
-	Duration        time.Duration       `json:"duration"`
+	Statistics      ScanStatistics       `json:"statistics"`
+	StartTime       time.Time            `json:"start_time"`
+	EndTime         time.Time            `json:"end_time"`
+	Duration        time.Duration        `json:"duration"`
 }
 
-// ScanStatistics holds scan statistics
+// ScanStatistics holds per-target scan statistics.
 type ScanStatistics struct {
 	TotalRequests   int64         `json:"total_requests"`
 	SuccessRequests int64         `json:"success_requests"`
@@ -72,303 +78,259 @@ type ScanStatistics struct {
 	MaxLatency      time.Duration `json:"max_latency"`
 }
 
-// ResultProcessor handles result processing and output
+// ResultProcessor handles result processing and output.
+// It is safe for concurrent use.
 type ResultProcessor struct {
-	config      *config.ScanConfig
-	results     map[string]*ScanResult
-	filesMap    map[string]struct{} // For deduplication
-	mu          sync.RWMutex
-	outputFile  *os.File
-	csvWriter   *csv.Writer
+	cfg              *config.ScanConfig
+	results          map[string]*ScanResult
+	filesMap         map[string]struct{} // for deduplication
+	mu               sync.RWMutex
+	outputFile       *os.File
+	csvWriter        *csv.Writer
+	csvHeaderWritten bool // ensures the CSV header is written exactly once
+	htmlTmpl         *template.Template
 }
 
-// NewResultProcessor creates a new result processor
-func NewResultProcessor(cfg *config.ScanConfig) *ResultProcessor {
+// NewResultProcessor creates a new ResultProcessor.
+// Returns an error if an output file is configured but cannot be created.
+func NewResultProcessor(cfg *config.ScanConfig) (*ResultProcessor, error) {
 	rp := &ResultProcessor{
-		config:   cfg,
+		cfg:      cfg,
 		results:  make(map[string]*ScanResult),
 		filesMap: make(map[string]struct{}),
 	}
-	
-	// Setup output file if specified
+
 	if cfg.OutputFile != "" {
 		file, err := os.Create(cfg.OutputFile)
-		if err == nil {
-			rp.outputFile = file
-			if cfg.Output == config.OutputCSV {
-				rp.csvWriter = csv.NewWriter(file)
-			}
+		if err != nil {
+			return nil, fmt.Errorf("create output file %q: %w", cfg.OutputFile, err)
+		}
+		rp.outputFile = file
+
+		if cfg.Output == config.OutputCSV {
+			rp.csvWriter = csv.NewWriter(file)
 		}
 	}
-	
-	return rp
+
+	// Pre-parse the HTML template so errors surface early.
+	if cfg.Output == config.OutputHTML {
+		tmpl, err := template.New("report").Parse(htmlReportTemplate)
+		if err != nil {
+			return nil, fmt.Errorf("parse HTML report template: %w", err)
+		}
+		rp.htmlTmpl = tmpl
+	}
+
+	return rp, nil
 }
 
-// AddResult adds a scan result
-func (rp *ResultProcessor) AddResult(result *ScanResult) {
+// AddResult adds a scan result, deduplicates files, and immediately writes output.
+func (rp *ResultProcessor) AddResult(scanResult *ScanResult) {
 	rp.mu.Lock()
 	defer rp.mu.Unlock()
-	
-	// Deduplicate files
-	dedupedFiles := make([]detection.FileInfo, 0)
-	for _, file := range result.FilesDiscovered {
-		key := result.TargetURL + file.ShortName
+
+	// Deduplicate discovered files across all calls.
+	dedupedFiles := make([]detection.FileInfo, 0, len(scanResult.FilesDiscovered))
+	for _, file := range scanResult.FilesDiscovered {
+		key := scanResult.TargetURL + file.ShortName
 		if _, exists := rp.filesMap[key]; !exists {
 			rp.filesMap[key] = struct{}{}
 			dedupedFiles = append(dedupedFiles, file)
 		}
 	}
-	result.FilesDiscovered = dedupedFiles
-	
-	rp.results[result.TargetURL] = result
-	
-	// Write to output immediately
-	rp.writeResult(result)
+	scanResult.FilesDiscovered = dedupedFiles
+
+	rp.results[scanResult.TargetURL] = scanResult
+
+	rp.writeResult(scanResult)
 }
 
-// writeResult writes a result to the configured output
-func (rp *ResultProcessor) writeResult(result *ScanResult) {
-	switch rp.config.Output {
+// writeResult dispatches to the appropriate format writer.
+// Must be called with rp.mu held.
+func (rp *ResultProcessor) writeResult(scanResult *ScanResult) {
+	switch rp.cfg.Output {
 	case config.OutputJSON:
-		rp.writeJSON(result)
+		rp.writeJSON(scanResult)
 	case config.OutputCSV:
-		rp.writeCSV(result)
+		rp.writeCSV(scanResult)
 	case config.OutputHTML:
-		rp.writeHTML(result)
+		rp.writeHTML(scanResult)
 	case config.OutputMarkdown:
-		rp.writeMarkdown(result)
+		rp.writeMarkdown(scanResult)
 	case config.OutputXML:
-		rp.writeXML(result)
+		rp.writeXML(scanResult)
 	default:
-		rp.writeHuman(result)
+		rp.writeHuman(scanResult)
 	}
 }
 
-// writeHuman writes human-readable output
-func (rp *ResultProcessor) writeHuman(result *ScanResult) {
+// writeHuman writes human-readable output with ANSI colours.
+func (rp *ResultProcessor) writeHuman(scanResult *ScanResult) {
 	fmt.Println("\n════════════════════════════════════════════════════════════════════════════════")
-	fmt.Printf("URL: %s\n", result.TargetURL)
-	fmt.Printf("Server: %s\n", result.ServerInfo)
-	
-	if result.Vulnerable {
+	fmt.Printf("URL: %s\n", scanResult.TargetURL)
+	fmt.Printf("Server: %s\n", scanResult.ServerInfo)
+
+	if scanResult.Vulnerable {
 		fmt.Printf("Vulnerable: \x1b[31;1mYes!\x1b[0m\n")
-		
-		// Print vulnerabilities
-		for _, vuln := range result.Vulnerabilities {
+
+		for _, vuln := range scanResult.Vulnerabilities {
 			fmt.Printf("\n  [!] %s (CVSS: %.1f - %s)\n", vuln.Name, vuln.CVSS.BaseScore, vuln.CVSS.Severity)
 			fmt.Printf("      %s\n", vuln.Description)
 		}
-		
-		// Print discovered files
-		if len(result.FilesDiscovered) > 0 {
+
+		if len(scanResult.FilesDiscovered) > 0 {
 			fmt.Println("\n  Discovered Files:")
-			for _, file := range result.FilesDiscovered {
-				fullName := file.FullName
-				if fullName == "" {
-					fullName = file.ShortName + "?"
+			for _, file := range scanResult.FilesDiscovered {
+				displayName := file.FullName
+				if displayName == "" {
+					displayName = file.ShortName + "?"
 				}
-				fmt.Printf("    - \x1b[32m%s\x1b[0m -> \x1b[33m%s\x1b[0m\n", file.ShortName, fullName)
+				fmt.Printf("    - \x1b[32m%s\x1b[0m -> \x1b[33m%s\x1b[0m\n", file.ShortName, displayName)
 			}
 		}
 	} else {
 		fmt.Printf("Vulnerable: \x1b[34mNo\x1b[0m (or no 8.3 files exist)\n")
 	}
-	
+
 	fmt.Println("════════════════════════════════════════════════════════════════════════════════")
 }
 
-// writeJSON writes JSON output
-func (rp *ResultProcessor) writeJSON(result *ScanResult) {
-	data, err := json.MarshalIndent(result, "", "  ")
+// writeJSON marshals the result to indented JSON.
+func (rp *ResultProcessor) writeJSON(scanResult *ScanResult) {
+	data, err := json.MarshalIndent(scanResult, "", "  ")
 	if err != nil {
+		log.Errorf("JSON marshal failed for %q: %v", scanResult.TargetURL, err)
 		return
 	}
-	
-	if rp.outputFile != nil {
-		rp.outputFile.Write(data)
-		rp.outputFile.Write([]byte("\n"))
-	} else {
-		fmt.Println(string(data))
+
+	out := rp.writer()
+	if _, writeErr := fmt.Fprintf(out, "%s\n", data); writeErr != nil {
+		log.Errorf("JSON write failed: %v", writeErr)
 	}
 }
 
-// writeCSV writes CSV output
-func (rp *ResultProcessor) writeCSV(result *ScanResult) {
+// writeCSV writes one row per discovered file; the header is written exactly once.
+func (rp *ResultProcessor) writeCSV(scanResult *ScanResult) {
 	if rp.csvWriter == nil {
 		return
 	}
-	
-	// Write header if first write
-	if len(rp.results) == 1 {
+
+	if !rp.csvHeaderWritten {
 		header := []string{"url", "vulnerable", "server", "file_short", "file_full", "confidence", "discovered_at"}
-		rp.csvWriter.Write(header)
+		if err := rp.csvWriter.Write(header); err != nil {
+			log.Errorf("CSV header write failed: %v", err)
+			return
+		}
+		rp.csvHeaderWritten = true
 	}
-	
-	// Write rows
-	for _, file := range result.FilesDiscovered {
+
+	for _, file := range scanResult.FilesDiscovered {
 		row := []string{
-			result.TargetURL,
-			fmt.Sprintf("%v", result.Vulnerable),
-			result.ServerInfo,
+			scanResult.TargetURL,
+			fmt.Sprintf("%v", scanResult.Vulnerable),
+			scanResult.ServerInfo,
 			file.ShortName,
 			file.FullName,
 			fmt.Sprintf("%.2f", file.Confidence),
 			file.DiscoveryTime.Format(time.RFC3339),
 		}
-		rp.csvWriter.Write(row)
+		if err := rp.csvWriter.Write(row); err != nil {
+			log.Errorf("CSV row write failed: %v", err)
+		}
 	}
 	rp.csvWriter.Flush()
 }
 
-// writeHTML writes HTML output
-func (rp *ResultProcessor) writeHTML(result *ScanResult) {
-	tmpl := `<!DOCTYPE html>
-<html>
-<head>
-    <title>Shortscan v2 - Scan Results</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 20px; background: #1a1a2e; color: #eee; }
-        .vulnerable { color: #ff6b6b; }
-        .safe { color: #4ecdc4; }
-        .file { color: #ffd93d; }
-        table { border-collapse: collapse; width: 100%; margin-top: 20px; }
-        th, td { border: 1px solid #333; padding: 10px; text-align: left; }
-        th { background: #16213e; }
-        .high { background: #ff6b6b; color: #000; }
-        .medium { background: #ffd93d; color: #000; }
-        .low { background: #4ecdc4; color: #000; }
-    </style>
-</head>
-<body>
-    <h1>🌀 Shortscan v2 - Scan Results</h1>
-    <div class="target">
-        <h2>Target: {{.TargetURL}}</h2>
-        <p>Server: {{.ServerInfo}}</p>
-        <p>Vulnerable: {{if .Vulnerable}}<span class="vulnerable">YES</span>{{else}}<span class="safe">NO</span>{{end}}</p>
-    </div>
-    {{if .Vulnerable}}
-    <div class="files">
-        <h3>Discovered Files ({{len .FilesDiscovered}})</h3>
-        <table>
-            <tr><th>Short Name</th><th>Full Name</th><th>Confidence</th></tr>
-            {{range .FilesDiscovered}}
-            <tr>
-                <td class="file">{{.ShortName}}</td>
-                <td>{{.FullName}}</td>
-                <td>{{printf "%.2f" .Confidence}}</td>
-            </tr>
-            {{end}}
-        </table>
-    </div>
-    {{end}}
-    <div class="stats">
-        <h3>Statistics</h3>
-        <p>Duration: {{.Duration}}</p>
-        <p>Requests: {{.Statistics.TotalRequests}}</p>
-    </div>
-</body>
-</html>`
-	
-	t, err := template.New("html").Parse(tmpl)
-	if err != nil {
-		return
+// writeHTML renders the embedded HTML template.
+func (rp *ResultProcessor) writeHTML(scanResult *ScanResult) {
+	out := rp.writer()
+	if err := rp.htmlTmpl.Execute(out, scanResult); err != nil {
+		log.Errorf("HTML template execution failed for %q: %v", scanResult.TargetURL, err)
 	}
-	
-	var output *os.File = os.Stdout
-	if rp.outputFile != nil {
-		output = rp.outputFile
-	}
-	
-	t.Execute(output, result)
 }
 
-// writeMarkdown writes Markdown output
-func (rp *ResultProcessor) writeMarkdown(result *ScanResult) {
+// writeMarkdown writes Markdown-formatted output.
+func (rp *ResultProcessor) writeMarkdown(scanResult *ScanResult) {
 	var sb strings.Builder
-	
+
 	sb.WriteString("# Shortscan v2 - Scan Results\n\n")
-	sb.WriteString(fmt.Sprintf("## Target: %s\n\n", result.TargetURL))
-	sb.WriteString(fmt.Sprintf("- **Server**: %s\n", result.ServerInfo))
-	sb.WriteString(fmt.Sprintf("- **Vulnerable**: %v\n", result.Vulnerable))
-	
-	if result.Vulnerable && len(result.FilesDiscovered) > 0 {
+	sb.WriteString(fmt.Sprintf("## Target: %s\n\n", scanResult.TargetURL))
+	sb.WriteString(fmt.Sprintf("- **Server**: %s\n", scanResult.ServerInfo))
+	sb.WriteString(fmt.Sprintf("- **Vulnerable**: %v\n", scanResult.Vulnerable))
+
+	if scanResult.Vulnerable && len(scanResult.FilesDiscovered) > 0 {
 		sb.WriteString("\n### Discovered Files\n\n")
 		sb.WriteString("| Short Name | Full Name | Confidence |\n")
 		sb.WriteString("|------------|-----------|------------|\n")
-		for _, file := range result.FilesDiscovered {
+		for _, file := range scanResult.FilesDiscovered {
 			sb.WriteString(fmt.Sprintf("| `%s` | `%s` | %.2f |\n", file.ShortName, file.FullName, file.Confidence))
 		}
 	}
-	
+
 	sb.WriteString("\n### Statistics\n\n")
-	sb.WriteString(fmt.Sprintf("- **Duration**: %v\n", result.Duration))
-	sb.WriteString(fmt.Sprintf("- **Total Requests**: %d\n", result.Statistics.TotalRequests))
-	
-	if rp.outputFile != nil {
-		rp.outputFile.WriteString(sb.String())
-	} else {
-		fmt.Print(sb.String())
+	sb.WriteString(fmt.Sprintf("- **Duration**: %v\n", scanResult.Duration))
+	sb.WriteString(fmt.Sprintf("- **Total Requests**: %d\n", scanResult.Statistics.TotalRequests))
+
+	out := rp.writer()
+	if _, err := fmt.Fprint(out, sb.String()); err != nil {
+		log.Errorf("Markdown write failed: %v", err)
 	}
 }
 
-// writeXML writes XML output
-func (rp *ResultProcessor) writeXML(result *ScanResult) {
-	type XMLResult struct {
-		XMLName     xml.Name `xml:"scan_result"`
-		TargetURL   string   `xml:"target_url"`
-		ServerInfo  string   `xml:"server_info"`
-		Vulnerable  bool     `xml:"vulnerable"`
-		Files       []detection.FileInfo `xml:"files>file"`
+// writeXML marshals the result to indented XML.
+func (rp *ResultProcessor) writeXML(scanResult *ScanResult) {
+	type xmlResult struct {
+		XMLName    xml.Name             `xml:"scan_result"`
+		TargetURL  string               `xml:"target_url"`
+		ServerInfo string               `xml:"server_info"`
+		Vulnerable bool                 `xml:"vulnerable"`
+		Files      []detection.FileInfo `xml:"files>file"`
 	}
-	
-	xmlResult := XMLResult{
-		TargetURL:   result.TargetURL,
-		ServerInfo:  result.ServerInfo,
-		Vulnerable:  result.Vulnerable,
-		Files:       result.FilesDiscovered,
+
+	payload := xmlResult{
+		TargetURL:  scanResult.TargetURL,
+		ServerInfo: scanResult.ServerInfo,
+		Vulnerable: scanResult.Vulnerable,
+		Files:      scanResult.FilesDiscovered,
 	}
-	
-	data, err := xml.MarshalIndent(xmlResult, "", "  ")
+
+	data, err := xml.MarshalIndent(payload, "", "  ")
 	if err != nil {
+		log.Errorf("XML marshal failed for %q: %v", scanResult.TargetURL, err)
 		return
 	}
-	
-	if rp.outputFile != nil {
-		rp.outputFile.Write(data)
-	} else {
-		fmt.Println(string(data))
+
+	out := rp.writer()
+	if _, writeErr := fmt.Fprintf(out, "%s\n", data); writeErr != nil {
+		log.Errorf("XML write failed: %v", writeErr)
 	}
 }
 
-// CalculateCVSS calculates CVSS score for IIS short filename enumeration
+// writer returns the configured output destination (file or stdout).
+func (rp *ResultProcessor) writer() *os.File {
+	if rp.outputFile != nil {
+		return rp.outputFile
+	}
+	return os.Stdout
+}
+
+// CalculateCVSS calculates a CVSS 3.1 base score for IIS short filename enumeration.
 func CalculateCVSS(filesExposed int, sensitiveFiles bool) CVSSScore {
-	// CVSS 3.1 Base Score calculation for IIS Short Filename Enumeration
-	// Attack Vector: Network (AV:N)
-	// Attack Complexity: Low (AC:L)
-	// Privileges Required: None (PR:N)
-	// User Interaction: None (UI:N)
-	// Scope: Unchanged (S:U)
-	// Confidentiality Impact: Low (C:L) - reveals file existence/names
-	// Integrity Impact: None (I:N)
-	// Availability Impact: None (A:N)
-	
 	var baseScore float64
 	var severity string
-	
-	if sensitiveFiles && filesExposed > 10 {
-		// High impact - many sensitive files exposed
-		baseScore = 7.5 // CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N
+
+	switch {
+	case sensitiveFiles && filesExposed > 10:
+		baseScore = 7.5
 		severity = "High"
-	} else if sensitiveFiles || filesExposed > 5 {
-		// Medium impact
-		baseScore = 5.3 // CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N
+	case sensitiveFiles || filesExposed > 5:
+		baseScore = 5.3
 		severity = "Medium"
-	} else {
-		// Low impact
-		baseScore = 3.7 // Limited exposure
+	default:
+		baseScore = 3.7
 		severity = "Low"
 	}
-	
+
 	return CVSSScore{
 		Vector:      "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
 		BaseScore:   baseScore,
@@ -378,47 +340,53 @@ func CalculateCVSS(filesExposed int, sensitiveFiles bool) CVSSScore {
 	}
 }
 
-// GetResults returns all results
+// GetResults returns a snapshot of all results.
 func (rp *ResultProcessor) GetResults() map[string]*ScanResult {
 	rp.mu.RLock()
 	defer rp.mu.RUnlock()
-	return rp.results
+
+	snapshot := make(map[string]*ScanResult, len(rp.results))
+	for k, v := range rp.results {
+		snapshot[k] = v
+	}
+	return snapshot
 }
 
-// GetSummary returns a summary of all results
+// GetSummary returns a one-line summary of all scan results.
 func (rp *ResultProcessor) GetSummary() string {
 	rp.mu.RLock()
 	defer rp.mu.RUnlock()
-	
-	var vulnerable, safe int
-	totalFiles := 0
-	
-	for _, result := range rp.results {
-		if result.Vulnerable {
-			vulnerable++
-			totalFiles += len(result.FilesDiscovered)
+
+	var vulnerableCount, safeCount, totalFiles int
+
+	for _, res := range rp.results {
+		if res.Vulnerable {
+			vulnerableCount++
+			totalFiles += len(res.FilesDiscovered)
 		} else {
-			safe++
+			safeCount++
 		}
 	}
-	
+
 	return fmt.Sprintf(
 		"Scan Summary: %d targets scanned, %d vulnerable, %d safe, %d files discovered",
-		len(rp.results), vulnerable, safe, totalFiles,
+		len(rp.results), vulnerableCount, safeCount, totalFiles,
 	)
 }
 
-// Close closes the result processor
+// Close flushes and closes all open output writers.
 func (rp *ResultProcessor) Close() {
 	if rp.csvWriter != nil {
 		rp.csvWriter.Flush()
 	}
 	if rp.outputFile != nil {
-		rp.outputFile.Close()
+		if err := rp.outputFile.Close(); err != nil {
+			log.Errorf("close output file: %v", err)
+		}
 	}
 }
 
-// SortFilesByConfidence sorts files by confidence level
+// SortFilesByConfidence sorts a slice of FileInfo by descending confidence.
 func SortFilesByConfidence(files []detection.FileInfo) {
 	sort.Slice(files, func(i, j int) bool {
 		return files[i].Confidence > files[j].Confidence

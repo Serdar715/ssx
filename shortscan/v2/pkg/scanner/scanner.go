@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fatih/color"
@@ -21,132 +22,130 @@ import (
 	"github.com/bitquark/shortscan/v2/pkg/result"
 )
 
-// Scanner is the main scanner struct
+// Scanner is the main scanner orchestrator.
 type Scanner struct {
-	config          *config.ScanConfig
+	cfg             *config.ScanConfig
 	httpEngine      *httpengine.HTTPEngine
 	detectionEngine *detection.DetectionEngine
 	resultProcessor *result.ResultProcessor
-	
-	// Progress tracking
-	totalTargets    int
-	scannedTargets  int32
-	mu              sync.RWMutex
+
+	// Progress tracking — updated atomically.
+	totalTargets   int
+	scannedTargets atomic.Int32
 }
 
-// NewScanner creates a new scanner
-func NewScanner(cfg *config.ScanConfig) *Scanner {
+// NewScanner creates a new Scanner from cfg.
+// Returns an error if the result processor cannot initialise its output file.
+func NewScanner(cfg *config.ScanConfig) (*Scanner, error) {
 	httpEngine := httpengine.NewHTTPEngine(cfg)
 	detectionEngine := detection.NewDetectionEngine(cfg, httpEngine)
-	resultProcessor := result.NewResultProcessor(cfg)
-	
+
+	resultProcessor, err := result.NewResultProcessor(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("initialise result processor: %w", err)
+	}
+
 	return &Scanner{
-		config:          cfg,
+		cfg:             cfg,
 		httpEngine:      httpEngine,
 		detectionEngine: detectionEngine,
 		resultProcessor: resultProcessor,
-	}
+	}, nil
 }
 
-// Scan starts the scanning process
+// Scan starts the scanning process for the given URL list.
+// It respects ctx cancellation: when ctx is cancelled in-flight goroutines exit cleanly.
 func (s *Scanner) Scan(ctx context.Context, urls []string) error {
-	// Normalize and prepare URLs
 	targets := s.prepareURLs(urls)
 	s.totalTargets = len(targets)
-	
-	// Print banner
+
 	s.printBanner()
-	
-	// Create semaphore for concurrency control
-	sem := make(chan struct{}, s.config.Concurrency)
-	
-	// WaitGroup for synchronization
+
+	sem := make(chan struct{}, s.cfg.Concurrency)
+
 	var wg sync.WaitGroup
-	
-	// Scan each target
+
 	for _, target := range targets {
 		wg.Add(1)
-		
-		go func(url string) {
+
+		go func(targetURL string) {
 			defer wg.Done()
-			
-			// Acquire semaphore
-			sem <- struct{}{}
+
+			// Acquire semaphore — respect context cancellation while waiting.
+			select {
+			case sem <- struct{}{}:
+				// slot acquired
+			case <-ctx.Done():
+				return
+			}
 			defer func() { <-sem }()
-			
-			// Scan single target
-			s.scanTarget(ctx, url)
+
+			s.scanTarget(ctx, targetURL)
 		}(target)
 	}
-	
-	// Wait for all scans to complete
+
 	wg.Wait()
-	
-	// Print summary
 	s.printSummary()
-	
 	return nil
 }
 
-// prepareURLs normalizes and prepares URLs for scanning
-func (s *Scanner) prepareURLs(urls []string) []string {
-	prepared := make([]string, 0, len(urls))
-	
-	for _, url := range urls {
-		url = strings.TrimSpace(url)
-		if url == "" {
+// prepareURLs normalises and deduplicates a list of raw URLs.
+func (s *Scanner) prepareURLs(rawURLs []string) []string {
+	seen := make(map[string]struct{}, len(rawURLs))
+	prepared := make([]string, 0, len(rawURLs))
+
+	for _, rawURL := range rawURLs {
+		rawURL = strings.TrimSpace(rawURL)
+		if rawURL == "" {
 			continue
 		}
-		
-		// Add protocol if missing
-		if !strings.Contains(url, "://") {
-			url = "https://" + url
+
+		if !strings.Contains(rawURL, "://") {
+			rawURL = "https://" + rawURL
 		}
-		
-		// Remove trailing slash
-		url = strings.TrimSuffix(url, "/")
-		
-		prepared = append(prepared, url)
+
+		rawURL = strings.TrimSuffix(rawURL, "/")
+
+		if _, exists := seen[rawURL]; !exists {
+			seen[rawURL] = struct{}{}
+			prepared = append(prepared, rawURL)
+		}
 	}
-	
+
 	return prepared
 }
 
-// scanTarget scans a single target
+// scanTarget scans a single target URL and stores the result.
 func (s *Scanner) scanTarget(ctx context.Context, targetURL string) {
 	startTime := time.Now()
-	
+
 	scanResult := &result.ScanResult{
-		TargetURL:    targetURL,
-		Vulnerable:   false,
-		StartTime:    startTime,
+		TargetURL:       targetURL,
+		Vulnerable:      false,
+		StartTime:       startTime,
 		FilesDiscovered: make([]detection.FileInfo, 0),
 		Vulnerabilities: make([]result.VulnerabilityInfo, 0),
 	}
-	
-	// Get server info
-	serverInfo := s.getServerInfo(ctx, targetURL)
-	scanResult.ServerInfo = serverInfo
-	
-	// Detect vulnerability
+
+	scanResult.ServerInfo = s.getServerInfo(ctx, targetURL)
+
 	detectionResult, err := s.detectionEngine.DetectVulnerability(ctx, targetURL)
 	if err != nil {
 		scanResult.EndTime = time.Now()
 		scanResult.Duration = scanResult.EndTime.Sub(startTime)
 		s.resultProcessor.AddResult(scanResult)
+		s.scannedTargets.Add(1)
 		return
 	}
-	
+
 	scanResult.Vulnerable = detectionResult.Vulnerable
-	
+
 	if detectionResult.Vulnerable {
-		// Create vulnerability info
 		vulnInfo := result.VulnerabilityInfo{
 			ID:          "IIS-SHORTNAME-001",
 			CVE:         "CVE-2025-46294",
 			Name:        "IIS Short Filename Enumeration",
 			Description: "The target is vulnerable to IIS short filename enumeration, allowing discovery of hidden files and directories",
-			CVSS:        result.CalculateCVSS(0, false),
 			Remediation: "Disable 8.3 filename creation by setting NtfsDisable8dot3NameCreation to 1 in the registry",
 			References: []string{
 				"https://techcommunity.microsoft.com/t5/iis-support-blog/iis-short-name-enumeration/ba-p/3951320",
@@ -156,24 +155,30 @@ func (s *Scanner) scanTarget(ctx context.Context, targetURL string) {
 			TargetURL:    targetURL,
 			Confidence:   detectionResult.Confidence,
 		}
+
+		// Set initial CVSS before enumeration (no files yet).
+		vulnInfo.CVSS = result.CalculateCVSS(0, false)
 		scanResult.Vulnerabilities = append(scanResult.Vulnerabilities, vulnInfo)
-		
-		// Enumerate files if not just checking vulnerability
-		if !s.config.VulnCheckOnly {
-			files, err := s.detectionEngine.EnumerateFiles(ctx, targetURL, detectionResult)
-			if err == nil {
+
+		if !s.cfg.VulnCheckOnly {
+			files, enumErr := s.detectionEngine.EnumerateFiles(ctx, targetURL, detectionResult)
+			if enumErr == nil {
 				scanResult.FilesDiscovered = files
-				vulnInfo.FilesExposed = files
-				vulnInfo.CVSS = result.CalculateCVSS(len(files), s.hasSensitiveFiles(files))
+
+				// Update the vulnerability entry in place — avoid stale copy.
+				lastIdx := len(scanResult.Vulnerabilities) - 1
+				scanResult.Vulnerabilities[lastIdx].FilesExposed = files
+				scanResult.Vulnerabilities[lastIdx].CVSS = result.CalculateCVSS(
+					len(files),
+					s.hasSensitiveFiles(files),
+				)
 			}
 		}
 	}
-	
-	// Finalize result
+
 	scanResult.EndTime = time.Now()
 	scanResult.Duration = scanResult.EndTime.Sub(startTime)
-	
-	// Get HTTP stats
+
 	stats := s.httpEngine.GetStats()
 	scanResult.Statistics = result.ScanStatistics{
 		TotalRequests:   stats.TotalRequests,
@@ -186,43 +191,46 @@ func (s *Scanner) scanTarget(ctx context.Context, targetURL string) {
 		MinLatency:      stats.MinLatency,
 		MaxLatency:      stats.MaxLatency,
 	}
-	
-	// Add result
+
 	s.resultProcessor.AddResult(scanResult)
+	s.scannedTargets.Add(1)
 }
 
-// getServerInfo retrieves server information
+// getServerInfo retrieves the Server and X-Aspnet-Version headers from the target.
 func (s *Scanner) getServerInfo(ctx context.Context, targetURL string) string {
-	resp, err := s.httpEngine.Request(ctx, "GET", targetURL+"/", nil)
+	resp, err := s.httpEngine.Request(ctx, http.MethodGet, targetURL+"/", nil)
 	if err != nil {
 		return "<unknown>"
 	}
-	
-	var info string
-	
-	// Get Server header
-	if server := resp.Header.Get("Server"); server != "" {
-		info = server
-	} else {
-		info = "<unknown>"
+
+	// Drain and close to avoid connection leaks.
+	defer func() {
+		if resp.Body != nil {
+			resp.Body.Close()
+		}
+	}()
+
+	serverHeader := resp.Header.Get("Server")
+	if serverHeader == "" {
+		serverHeader = "<unknown>"
 	}
-	
-	// Add ASP.NET version if present
+
 	if aspNet := resp.Header.Get("X-Aspnet-Version"); aspNet != "" {
-		info += fmt.Sprintf(" (ASP.NET v%s)", aspNet)
+		serverHeader += fmt.Sprintf(" (ASP.NET v%s)", aspNet)
 	}
-	
-	return info
+
+	return serverHeader
 }
 
-// hasSensitiveFiles checks if any discovered files are sensitive
+// sensitivePatterns contains lowercase substrings that indicate a file may be sensitive.
+var sensitivePatterns = []string{
+	"web.config", "password", "secret", "key", "credential",
+	"backup", "database", "admin", "config",
+	".bak", ".sql", ".mdb", ".log",
+}
+
+// hasSensitiveFiles reports whether any discovered file matches a sensitive pattern.
 func (s *Scanner) hasSensitiveFiles(files []detection.FileInfo) bool {
-	sensitivePatterns := []string{
-		"web.config", "password", "secret", "key", "credential",
-		"backup", "db", "database", "admin", "config",
-		".bak", ".sql", ".mdb", ".log", ".xml",
-	}
-	
 	for _, file := range files {
 		lowerName := strings.ToLower(file.FullName)
 		for _, pattern := range sensitivePatterns {
@@ -231,40 +239,43 @@ func (s *Scanner) hasSensitiveFiles(files []detection.FileInfo) bool {
 			}
 		}
 	}
-	
 	return false
 }
 
-// printBanner prints the scanner banner
-func (s *Scanner) printBanner() {
-	if s.config.Quiet {
-		return
-	}
-	
-	banner := color.New(color.FgBlue, color.Bold).Sprint("🌀 Shortscan v"+config.Version) +
-		" · " + color.New(color.FgWhite, color.Bold).Sprint("Advanced IIS Short Filename Enumeration")
-	
-	fmt.Println(banner)
-	fmt.Printf("Targets: %d | Concurrency: %d | Timeout: %v\n",
-		s.totalTargets, s.config.Concurrency, s.config.Timeout)
+// Progress returns the number of targets scanned so far.
+func (s *Scanner) Progress() (scanned, total int) {
+	return int(s.scannedTargets.Load()), s.totalTargets
 }
 
-// printSummary prints the scan summary
-func (s *Scanner) printSummary() {
-	if s.config.Quiet {
+// printBanner prints the scanner banner unless quiet mode is enabled.
+func (s *Scanner) printBanner() {
+	if s.cfg.Quiet {
 		return
 	}
-	
+
+	banner := color.New(color.FgBlue, color.Bold).Sprint("🌀 Shortscan v"+config.Version) +
+		" · " + color.New(color.FgWhite, color.Bold).Sprint("Advanced IIS Short Filename Enumeration")
+
+	fmt.Println(banner)
+	fmt.Printf("Targets: %d | Concurrency: %d | Timeout: %v\n",
+		s.totalTargets, s.cfg.Concurrency, s.cfg.Timeout)
+}
+
+// printSummary prints the scan summary unless quiet mode is enabled.
+func (s *Scanner) printSummary() {
+	if s.cfg.Quiet {
+		return
+	}
+
 	fmt.Println("\n" + strings.Repeat("═", 80))
 	fmt.Println(s.resultProcessor.GetSummary())
-	
-	// Print statistics
+
 	stats := s.httpEngine.GetStats()
 	fmt.Printf("Statistics: %d requests, %d retries, %d bytes sent, %d bytes received\n",
 		stats.TotalRequests, stats.Retries, stats.BytesSent, stats.BytesReceived)
 }
 
-// Close closes the scanner and cleans up resources
+// Close releases resources held by the scanner.
 func (s *Scanner) Close() {
 	s.resultProcessor.Close()
 }

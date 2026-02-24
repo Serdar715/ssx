@@ -10,9 +10,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
+	log "github.com/sirupsen/logrus"
 
 	"github.com/bitquark/shortscan/v2/pkg/config"
 	"github.com/bitquark/shortscan/v2/pkg/detection"
@@ -20,75 +22,85 @@ import (
 	"github.com/bitquark/shortscan/v2/pkg/result"
 )
 
-// Server represents the API server
+// Server represents the API server.
 type Server struct {
-	config          *config.ScanConfig
+	cfg             *config.ScanConfig
 	httpEngine      *httpengine.HTTPEngine
 	detectionEngine *detection.DetectionEngine
 	resultProcessor *result.ResultProcessor
 	server          *http.Server
 }
 
-// ScanRequest represents a scan request
+// ScanRequest represents a scan request payload.
 type ScanRequest struct {
-	URLs       []string          `json:"urls"`
-	Headers    map[string]string `json:"headers,omitempty"`
-	Options    ScanOptions       `json:"options,omitempty"`
+	URLs    []string          `json:"urls"`
+	Headers map[string]string `json:"headers,omitempty"`
+	Options ScanOptions       `json:"options,omitempty"`
 }
 
-// ScanOptions represents scan options
+// ScanOptions represents optional overrides for a single scan request.
 type ScanOptions struct {
-	Concurrency  int    `json:"concurrency,omitempty"`
-	Timeout      int    `json:"timeout,omitempty"`
-	Detection    string `json:"detection,omitempty"`
-	Recurse      bool   `json:"recurse,omitempty"`
-	VulnCheckOnly bool  `json:"vuln_check_only,omitempty"`
+	Concurrency   int    `json:"concurrency,omitempty"`
+	Timeout       int    `json:"timeout,omitempty"`
+	Detection     string `json:"detection,omitempty"`
+	Recurse       bool   `json:"recurse,omitempty"`
+	VulnCheckOnly bool   `json:"vuln_check_only,omitempty"`
 }
 
-// ScanResponse represents a scan response
+// ScanResponse wraps results returned by /api/v1/scan.
 type ScanResponse struct {
-	Success bool                    `json:"success"`
-	Message string                  `json:"message,omitempty"`
-	Results []result.ScanResult     `json:"results,omitempty"`
+	Success bool                `json:"success"`
+	Message string              `json:"message,omitempty"`
+	Results []result.ScanResult `json:"results,omitempty"`
 }
 
-// ErrorResponse represents an error response
+// ErrorResponse wraps error information returned on failures.
 type ErrorResponse struct {
 	Error   string `json:"error"`
 	Message string `json:"message"`
 }
 
-// NewServer creates a new API server
-func NewServer(cfg *config.ScanConfig) *Server {
+// detectResult is used internally by /api/v1/detect.
+type detectResult struct {
+	URL        string  `json:"url"`
+	Vulnerable bool    `json:"vulnerable"`
+	Confidence float64 `json:"confidence"`
+	Method     string  `json:"method"`
+}
+
+// NewServer creates a new API server and its dependencies.
+func NewServer(cfg *config.ScanConfig) (*Server, error) {
 	httpEngine := httpengine.NewHTTPEngine(cfg)
 	detectionEngine := detection.NewDetectionEngine(cfg, httpEngine)
-	resultProcessor := result.NewResultProcessor(cfg)
-	
+
+	resultProcessor, err := result.NewResultProcessor(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("initialise result processor: %w", err)
+	}
+
 	return &Server{
-		config:          cfg,
+		cfg:             cfg,
 		httpEngine:      httpEngine,
 		detectionEngine: detectionEngine,
 		resultProcessor: resultProcessor,
-	}
+	}, nil
 }
 
-// Start starts the API server
+// Start registers routes and starts listening on the given port.
+// It blocks until the server is stopped; use Shutdown to stop it gracefully.
 func (s *Server) Start(port int) error {
 	router := mux.NewRouter()
-	
-	// API routes
-	api := router.PathPrefix("/api/v1").Subrouter()
-	api.HandleFunc("/scan", s.handleScan).Methods("POST")
-	api.HandleFunc("/scan/{id}", s.handleGetScan).Methods("GET")
-	api.HandleFunc("/detect", s.handleDetect).Methods("POST")
-	api.HandleFunc("/status", s.handleStatus).Methods("GET")
-	api.HandleFunc("/health", s.handleHealth).Methods("GET")
-	
-	// Middleware
+
+	apiRouter := router.PathPrefix("/api/v1").Subrouter()
+	apiRouter.HandleFunc("/scan", s.handleScan).Methods(http.MethodPost)
+	apiRouter.HandleFunc("/scan/{id}", s.handleGetScan).Methods(http.MethodGet)
+	apiRouter.HandleFunc("/detect", s.handleDetect).Methods(http.MethodPost)
+	apiRouter.HandleFunc("/status", s.handleStatus).Methods(http.MethodGet)
+	apiRouter.HandleFunc("/health", s.handleHealth).Methods(http.MethodGet)
+
 	router.Use(s.loggingMiddleware)
 	router.Use(s.authMiddleware)
-	
-	// Create server
+
 	s.server = &http.Server{
 		Addr:         fmt.Sprintf(":%d", port),
 		Handler:      router,
@@ -96,11 +108,11 @@ func (s *Server) Start(port int) error {
 		WriteTimeout: 60 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
-	
+
 	return s.server.ListenAndServe()
 }
 
-// Shutdown gracefully shuts down the server
+// Shutdown gracefully stops the server.
 func (s *Server) Shutdown(ctx context.Context) error {
 	if s.server != nil {
 		return s.server.Shutdown(ctx)
@@ -108,213 +120,232 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// handleScan handles scan requests
+// handleScan handles POST /api/v1/scan — scans all URLs concurrently.
 func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 	var req ScanRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.sendError(w, http.StatusBadRequest, "Invalid request body", err.Error())
+		s.sendError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	
+
 	if len(req.URLs) == 0 {
-		s.sendError(w, http.StatusBadRequest, "No URLs provided", "At least one URL is required")
+		s.sendError(w, http.StatusBadRequest, "missing_urls", "at least one URL is required")
 		return
 	}
-	
-	// Create context with timeout
+
+	// 5-minute upper bound for the entire scan batch.
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
-	
-	results := make([]result.ScanResult, 0)
-	
-	for _, url := range req.URLs {
-		// Detect vulnerability
-		detectionResult, err := s.detectionEngine.DetectVulnerability(ctx, url)
-		if err != nil {
-			continue
-		}
-		
-		scanResult := result.ScanResult{
-			TargetURL:  url,
-			Vulnerable: detectionResult.Vulnerable,
-			StartTime:  time.Now(),
-		}
-		
-		if detectionResult.Vulnerable {
-			// Enumerate files
-			files, _ := s.detectionEngine.EnumerateFiles(ctx, url, detectionResult)
-			scanResult.FilesDiscovered = files
-			
-			// Create vulnerability info
-			vulnInfo := result.VulnerabilityInfo{
-				ID:           "IIS-SHORTNAME-001",
-				Name:         "IIS Short Filename Enumeration",
-				Description:  "Target is vulnerable to IIS short filename enumeration",
-				CVSS:         result.CalculateCVSS(len(files), false),
-				DiscoveredAt: time.Now(),
-				TargetURL:    url,
-				Confidence:   detectionResult.Confidence,
-			}
-			scanResult.Vulnerabilities = append(scanResult.Vulnerabilities, vulnInfo)
-		}
-		
-		scanResult.EndTime = time.Now()
-		scanResult.Duration = scanResult.EndTime.Sub(scanResult.StartTime)
-		
-		results = append(results, scanResult)
+
+	type indexed struct {
+		pos    int
+		result result.ScanResult
 	}
-	
+
+	resultsCh := make(chan indexed, len(req.URLs))
+	var wg sync.WaitGroup
+
+	for pos, rawURL := range req.URLs {
+		wg.Add(1)
+		go func(idx int, targetURL string) {
+			defer wg.Done()
+
+			scanResult := result.ScanResult{
+				TargetURL: targetURL,
+				StartTime: time.Now(),
+			}
+
+			detectionResult, err := s.detectionEngine.DetectVulnerability(ctx, targetURL)
+			if err != nil {
+				scanResult.EndTime = time.Now()
+				scanResult.Duration = scanResult.EndTime.Sub(scanResult.StartTime)
+				resultsCh <- indexed{pos: idx, result: scanResult}
+				return
+			}
+
+			scanResult.Vulnerable = detectionResult.Vulnerable
+
+			if detectionResult.Vulnerable {
+				files, _ := s.detectionEngine.EnumerateFiles(ctx, targetURL, detectionResult)
+				scanResult.FilesDiscovered = files
+
+				vulnInfo := result.VulnerabilityInfo{
+					ID:           "IIS-SHORTNAME-001",
+					Name:         "IIS Short Filename Enumeration",
+					Description:  "Target is vulnerable to IIS short filename enumeration",
+					CVSS:         result.CalculateCVSS(len(files), false),
+					FilesExposed: files,
+					DiscoveredAt: time.Now(),
+					TargetURL:    targetURL,
+					Confidence:   detectionResult.Confidence,
+				}
+				scanResult.Vulnerabilities = append(scanResult.Vulnerabilities, vulnInfo)
+			}
+
+			scanResult.EndTime = time.Now()
+			scanResult.Duration = scanResult.EndTime.Sub(scanResult.StartTime)
+			resultsCh <- indexed{pos: idx, result: scanResult}
+		}(pos, rawURL)
+	}
+
+	// Close channel once all goroutines finish.
+	go func() {
+		wg.Wait()
+		close(resultsCh)
+	}()
+
+	// Collect and order results.
+	ordered := make([]result.ScanResult, len(req.URLs))
+	for item := range resultsCh {
+		ordered[item.pos] = item.result
+	}
+
 	s.sendJSON(w, http.StatusOK, ScanResponse{
 		Success: true,
-		Message: fmt.Sprintf("Scanned %d targets", len(req.URLs)),
-		Results: results,
+		Message: fmt.Sprintf("scanned %d targets", len(req.URLs)),
+		Results: ordered,
 	})
 }
 
-// handleDetect handles quick vulnerability detection
+// handleDetect handles POST /api/v1/detect — quick vulnerability check, no enumeration.
 func (s *Server) handleDetect(w http.ResponseWriter, r *http.Request) {
 	var req ScanRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.sendError(w, http.StatusBadRequest, "Invalid request body", err.Error())
+		s.sendError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	
+
 	if len(req.URLs) == 0 {
-		s.sendError(w, http.StatusBadRequest, "No URLs provided", "At least one URL is required")
+		s.sendError(w, http.StatusBadRequest, "missing_urls", "at least one URL is required")
 		return
 	}
-	
+
 	ctx, cancel := context.WithTimeout(r.Context(), time.Minute)
 	defer cancel()
-	
-	type DetectResult struct {
-		URL        string  `json:"url"`
-		Vulnerable bool    `json:"vulnerable"`
-		Confidence float64 `json:"confidence"`
-		Method     string  `json:"method"`
+
+	type response struct {
+		Success bool           `json:"success"`
+		Results []detectResult `json:"results"`
 	}
-	
-	results := make([]DetectResult, 0)
-	
-	for _, url := range req.URLs {
-		detectionResult, err := s.detectionEngine.DetectVulnerability(ctx, url)
-		if err != nil {
-			results = append(results, DetectResult{URL: url, Vulnerable: false})
-			continue
-		}
-		
-		results = append(results, DetectResult{
-			URL:        url,
-			Vulnerable: detectionResult.Vulnerable,
-			Confidence: detectionResult.Confidence,
-			Method:     detectionResult.Method,
-		})
+
+	resultsCh := make(chan detectResult, len(req.URLs))
+	var wg sync.WaitGroup
+
+	for _, rawURL := range req.URLs {
+		wg.Add(1)
+		go func(targetURL string) {
+			defer wg.Done()
+
+			detResult, err := s.detectionEngine.DetectVulnerability(ctx, targetURL)
+			if err != nil {
+				resultsCh <- detectResult{URL: targetURL, Vulnerable: false}
+				return
+			}
+			resultsCh <- detectResult{
+				URL:        targetURL,
+				Vulnerable: detResult.Vulnerable,
+				Confidence: detResult.Confidence,
+				Method:     detResult.Method,
+			}
+		}(rawURL)
 	}
-	
-	s.sendJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"results": results,
-	})
+
+	go func() {
+		wg.Wait()
+		close(resultsCh)
+	}()
+
+	results := make([]detectResult, 0, len(req.URLs))
+	for res := range resultsCh {
+		results = append(results, res)
+	}
+
+	s.sendJSON(w, http.StatusOK, response{Success: true, Results: results})
 }
 
-// handleGetScan handles getting scan results by ID
+// handleGetScan handles GET /api/v1/scan/{id}.
+// TODO: Implement persistent scan result storage.
 func (s *Server) handleGetScan(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
-	scanID := vars["id"]
-	
-	// TODO: Implement scan result storage and retrieval
-	s.sendJSON(w, http.StatusOK, map[string]interface{}{
+	s.sendJSON(w, http.StatusOK, map[string]any{
 		"success": true,
-		"scan_id": scanID,
-		"message": "Scan result retrieval not yet implemented",
+		"scan_id": vars["id"],
+		"message": "scan result retrieval not yet implemented",
 	})
 }
 
-// handleStatus handles status requests
+// handleStatus handles GET /api/v1/status.
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	stats := s.httpEngine.GetStats()
-	
-	s.sendJSON(w, http.StatusOK, map[string]interface{}{
-		"success":   true,
-		"version":   config.Version,
-		"build":     config.BuildDate,
+	s.sendJSON(w, http.StatusOK, map[string]any{
+		"success":    true,
+		"version":    config.Version,
+		"build":      config.BuildDate,
 		"statistics": stats,
 	})
 }
 
-// handleHealth handles health check requests
+// handleHealth handles GET /api/v1/health.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	s.sendJSON(w, http.StatusOK, map[string]interface{}{
+	s.sendJSON(w, http.StatusOK, map[string]any{
 		"status": "healthy",
 		"time":   time.Now().Format(time.RFC3339),
 	})
 }
 
-// loggingMiddleware logs all requests
+// loggingMiddleware logs every request with method, path, status, and duration.
 func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		
-		// Wrap response writer to capture status
-		wrapped := &responseWriter{ResponseWriter: w}
-		
+		wrapped := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+
 		next.ServeHTTP(wrapped, r)
-		
-		duration := time.Since(start)
-		fmt.Printf("[%s] %s %s %d %v\n",
-			time.Now().Format("2006-01-02 15:04:05"),
-			r.Method,
-			r.URL.Path,
-			wrapped.status,
-			duration,
-		)
+
+		log.Infof("[API] %s %s %d %v", r.Method, r.URL.Path, wrapped.status, time.Since(start))
 	})
 }
 
-// authMiddleware handles API authentication
+// authMiddleware enforces API key authentication when cfg.APIKey is set.
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Skip auth for health endpoint
+		// Health endpoint is always public.
 		if r.URL.Path == "/api/v1/health" {
 			next.ServeHTTP(w, r)
 			return
 		}
-		
-		// Check API key if configured
-		if s.config.APIKey != "" {
-			apiKey := r.Header.Get("X-API-Key")
-			if apiKey != s.config.APIKey {
-				s.sendError(w, http.StatusUnauthorized, "Unauthorized", "Invalid API key")
+
+		if s.cfg.APIKey != "" {
+			if r.Header.Get("X-API-Key") != s.cfg.APIKey {
+				s.sendError(w, http.StatusUnauthorized, "unauthorized", "invalid API key")
 				return
 			}
 		}
-		
+
 		next.ServeHTTP(w, r)
 	})
 }
 
-// sendJSON sends a JSON response
-func (s *Server) sendJSON(w http.ResponseWriter, status int, data interface{}) {
+// sendJSON writes a JSON response, logging any encoding errors.
+func (s *Server) sendJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(data)
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		log.Errorf("JSON encode failed (status %d): %v", status, err)
+	}
 }
 
-// sendError sends an error response
-func (s *Server) sendError(w http.ResponseWriter, status int, error, message string) {
-	s.sendJSON(w, status, ErrorResponse{
-		Error:   error,
-		Message: message,
-	})
+// sendError writes a structured JSON error response.
+func (s *Server) sendError(w http.ResponseWriter, status int, errCode, message string) {
+	s.sendJSON(w, status, ErrorResponse{Error: errCode, Message: message})
 }
 
-// responseWriter wraps http.ResponseWriter to capture status
-type responseWriter struct {
+// statusRecorder wraps http.ResponseWriter to capture the response status code.
+type statusRecorder struct {
 	http.ResponseWriter
 	status int
 }
 
-func (rw *responseWriter) WriteHeader(status int) {
-	rw.status = status
-	rw.ResponseWriter.WriteHeader(status)
+func (sr *statusRecorder) WriteHeader(status int) {
+	sr.status = status
+	sr.ResponseWriter.WriteHeader(status)
 }
