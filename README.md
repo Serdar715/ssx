@@ -66,29 +66,39 @@ An attacker can enumerate these short names through HTTP requests and reconstruc
 
 ## ⚙️ Installation
 
-### Option 1 — Go Install (Recommended)
-
-```bash
-go install github.com/Serdar715/ssx/shortscan/v2/cmd/ssx@latest
-```
-
-### Option 2 — Build from Source
+### Option 1 — Build from Source (Recommended)
 
 ```bash
 git clone https://github.com/Serdar715/ssx.git
 cd ssx/shortscan/v2
-go mod tidy
 go build -o ssx ./cmd/ssx
+
+# Install globally (Linux/macOS)
+sudo cp ssx /usr/local/bin/ssx
+
+# Windows — copy to any directory in your PATH
+copy ssx.exe C:\Windows\System32\ssx.exe
 ```
 
-### Option 3 — Install utility tool as well
+### Option 2 — Go Install
 
 ```bash
-# Main scanner
 go install github.com/Serdar715/ssx/shortscan/v2/cmd/ssx@latest
+```
 
-# Checksum utility
-go install github.com/Serdar715/ssx/shortscan/cmd/shortutil@latest
+> **Note:** `go install` fetches the binary via the Go module proxy. If you get a module path error, use Option 1 (build from source) instead.
+>
+> Make sure `$(go env GOPATH)/bin` is in your `PATH`:
+> ```bash
+> export PATH=$PATH:$(go env GOPATH)/bin
+> ```
+
+### Install utility tool (`shortutil`)
+
+```bash
+cd ssx/shortscan
+go build -o shortutil ./cmd/shortutil
+sudo cp shortutil /usr/local/bin/shortutil
 ```
 
 **Requirements:** Go 1.21+
@@ -135,14 +145,14 @@ HTTP Options:
       --rate-limit N       Maximum requests per second [default: 100]
 
 Proxy Options:
-  -p, --proxy URL          Proxy URL (e.g., http://127.0.0.1:8080, socks5://127.0.0.1:1080)
+  -x, --proxy URL          Proxy URL (e.g., http://127.0.0.1:8080, socks5://127.0.0.1:1080)
       --proxy-file FILE    File with proxy URLs for round-robin rotation (one per line)
 
 Detection Options:
   -d, --detection MODE     Detection mode: auto|method|status|distance|timing|fuzzy|none [default: auto]
   -C, --characters CHARS   Characters to enumerate in filenames [default: JFKGOTMYVHSPCANDXLRWEBQUIZ8549176320-_()&'!#$%@^{}~]
   -s, --stabilize          Enable result stabilization for unstable servers (more requests)
-      --patience N         Patience level 0 or 1; higher = more method/path combinations [default: 0]
+  -p, --patience N         Patience level: 0=patient, 1=very patient (more method/path combos) [default: 0]
 
 Scan Behaviour:
   -n, --no-recurse         Disable recursive subdirectory scanning

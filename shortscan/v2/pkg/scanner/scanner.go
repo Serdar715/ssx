@@ -32,6 +32,10 @@ type Scanner struct {
 	// Progress tracking — updated atomically.
 	totalTargets   int
 	scannedTargets atomic.Int32
+
+	// stopped is set to true when the context is cancelled so that
+	// in-flight goroutines do not emit results after a Ctrl+C.
+	stopped atomic.Bool
 }
 
 // NewScanner creates a new Scanner from cfg.
@@ -62,7 +66,6 @@ func (s *Scanner) Scan(ctx context.Context, urls []string) error {
 	s.printBanner()
 
 	sem := make(chan struct{}, s.cfg.Concurrency)
-
 	var wg sync.WaitGroup
 
 	for _, target := range targets {
@@ -76,6 +79,7 @@ func (s *Scanner) Scan(ctx context.Context, urls []string) error {
 			case sem <- struct{}{}:
 				// slot acquired
 			case <-ctx.Done():
+				s.stopped.Store(true)
 				return
 			}
 			defer func() { <-sem }()
@@ -83,6 +87,13 @@ func (s *Scanner) Scan(ctx context.Context, urls []string) error {
 			s.scanTarget(ctx, targetURL)
 		}(target)
 	}
+
+	// Mark stopped before waiting so any goroutine finishing after
+	// cancellation also suppresses output.
+	go func() {
+		<-ctx.Done()
+		s.stopped.Store(true)
+	}()
 
 	wg.Wait()
 	s.printSummary()
@@ -116,7 +127,13 @@ func (s *Scanner) prepareURLs(rawURLs []string) []string {
 }
 
 // scanTarget scans a single target URL and stores the result.
+// It returns immediately without emitting output if the context was cancelled.
 func (s *Scanner) scanTarget(ctx context.Context, targetURL string) {
+	// If the caller cancelled before we even started, skip silently.
+	if s.stopped.Load() {
+		return
+	}
+
 	startTime := time.Now()
 
 	scanResult := &result.ScanResult{
@@ -127,10 +144,17 @@ func (s *Scanner) scanTarget(ctx context.Context, targetURL string) {
 		Vulnerabilities: make([]result.VulnerabilityInfo, 0),
 	}
 
-	scanResult.ServerInfo = s.getServerInfo(ctx, targetURL)
+	// Skip the extra HEAD request for server info in vuln-check-only mode.
+	if !s.cfg.VulnCheckOnly {
+		scanResult.ServerInfo = s.getServerInfo(ctx, targetURL)
+	}
 
 	detectionResult, err := s.detectionEngine.DetectVulnerability(ctx, targetURL)
 	if err != nil {
+		// Don't emit results for errors that stemmed from cancellation.
+		if s.stopped.Load() {
+			return
+		}
 		scanResult.EndTime = time.Now()
 		scanResult.Duration = scanResult.EndTime.Sub(startTime)
 		s.resultProcessor.AddResult(scanResult)
@@ -190,6 +214,11 @@ func (s *Scanner) scanTarget(ctx context.Context, targetURL string) {
 		AvgLatency:      stats.AvgLatency,
 		MinLatency:      stats.MinLatency,
 		MaxLatency:      stats.MaxLatency,
+	}
+
+	// Final check: don't print results that arrived after cancellation.
+	if s.stopped.Load() {
+		return
 	}
 
 	s.resultProcessor.AddResult(scanResult)
@@ -268,6 +297,13 @@ func (s *Scanner) printSummary() {
 	}
 
 	fmt.Println("\n" + strings.Repeat("═", 80))
+
+	if s.stopped.Load() {
+		scanned, total := s.Progress()
+		fmt.Printf("Scan interrupted: %d/%d targets scanned\n", scanned, total)
+		return
+	}
+
 	fmt.Println(s.resultProcessor.GetSummary())
 
 	stats := s.httpEngine.GetStats()

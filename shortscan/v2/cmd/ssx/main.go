@@ -39,14 +39,14 @@ type CommandLineArgs struct {
 	RateLimit   int      `arg:"--rate-limit"          help:"Max requests per second"       default:"100"`
 
 	// Proxy options
-	Proxy     string `arg:"-p,--proxy"      help:"Proxy URL (e.g. http://127.0.0.1:8080)" placeholder:"URL"`
+	Proxy     string `arg:"-x,--proxy"      help:"Proxy URL (e.g. http://127.0.0.1:8080, socks5://127.0.0.1:1080)" placeholder:"URL"`
 	ProxyFile string `arg:"--proxy-file"    help:"File with proxy URLs for rotation"       placeholder:"FILE"`
 
 	// Detection options
 	Detection  string `arg:"-d,--detection"  help:"Detection mode: auto|method|status|distance|timing|fuzzy|none" default:"auto"`
 	Characters string `arg:"-C,--characters" help:"Characters to enumerate"                                        default:"JFKGOTMYVHSPCANDXLRWEBQUIZ8549176320-_()&'!#\\$%@^{}~"`
 	Stabilize  bool   `arg:"-s,--stabilize"  help:"Attempt to stabilise results on unstable servers"`
-	Patience   int    `arg:"--patience"      help:"Patience level (0-1)"                                           default:"0"`
+	Patience   int    `arg:"-p,--patience"   help:"Patience level (0=patient, 1=very patient)"                      default:"0"`
 
 	// Scan behaviour
 	NoRecurse bool `arg:"-n,--no-recurse" help:"Disable recursive directory scanning"`
