@@ -440,86 +440,133 @@ func (de *DetectionEngine) EnumerateFiles(ctx context.Context, baseURL string, d
 	return allFiles, nil
 }
 
-// enumerateRecursive recursively enumerates files and extensions for a given tilde variant.
-// httpMethod is the HTTP method derived from the detection result and is passed explicitly
-// to avoid embedding it in URL strings.
-func (de *DetectionEngine) enumerateRecursive(
+// enumerateFileName recursively builds the 8.3 filename prefix (up to MaxFilenameLen chars).
+// When no further char extends the prefix, it calls enumerateExtension to discover the extension.
+func (de *DetectionEngine) enumerateFileName(
 	ctx context.Context,
-	baseURL, file, tilde, ext, fileChars, extChars string,
+	baseURL, file, tilde, fileChars, extChars string,
 	detResult *DetectionResult,
 ) []FileInfo {
 	files := make([]FileInfo, 0)
-	inExtMode := len(ext) > 0
+	anyMatch := false
 
-	chars := fileChars
-	if inExtMode {
-		chars = extChars
-	}
-
-	for _, char := range chars {
-		var newFile, newExt string
-		if inExtMode {
-			newExt = ext + string(char)
-		} else {
-			newFile = file + string(char)
-		}
-
-		// Build the probe URL — use the same suffix that triggered detection.
-		var testURL string
-		if inExtMode {
-			// Extension mode: *~N.EXT* — no path suffix needed here.
-			testURL = fmt.Sprintf("%s%s%s%s*", baseURL, newFile, tilde, newExt)
-		} else {
-			// File mode: match beginning of 8.3 name — apply detection suffix.
-			testURL = fmt.Sprintf("%s%s*%s*%s", baseURL, newFile, tilde, detResult.Suffix)
-		}
+	for _, char := range []rune(fileChars) {
+		newFile := file + string(char)
+		// IIS pattern: NEWFILE*~N*SUFFIX — does any file starting with newFile exist?
+		testURL := fmt.Sprintf("%s%s*%s*%s", baseURL, newFile, tilde, detResult.Suffix)
 
 		resp, err := de.httpEngine.Request(ctx, detResult.Method, testURL, nil)
 		if err != nil {
 			continue
 		}
 		drainAndClose(resp.Body)
-
-		if resp.StatusCode != detResult.StatusPos {
+		if resp.StatusCode == detResult.StatusNeg {
 			continue
 		}
 
-		// Check whether this is a complete (non-wildcard) match.
-		if de.isCompleteFile(ctx, baseURL, newFile, tilde, newExt, detResult) {
-			fileInfo := FileInfo{
-				ShortName:     newFile + tilde + newExt,
-				BaseURL:       baseURL,
-				Tilde:         tilde,
-				Extension:     newExt,
-				DiscoveryTime: time.Now(),
-				Confidence:    0.95,
+		anyMatch = true
+
+		if len(newFile) < config.MaxFilenameLen {
+			// Recurse: try to extend filename by one more char.
+			deeper := de.enumerateFileName(ctx, baseURL, newFile, tilde, fileChars, extChars, detResult)
+			if len(deeper) > 0 {
+				files = append(files, deeper...)
+			} else {
+				// No char extends newFile further → filename is complete at newFile.
+				files = append(files, de.enumerateExtension(ctx, baseURL, newFile, tilde, "", extChars, detResult)...)
 			}
-			files = append(files, fileInfo)
+		} else {
+			// Reached MaxFilenameLen — must transition to extension discovery.
+			files = append(files, de.enumerateExtension(ctx, baseURL, newFile, tilde, "", extChars, detResult)...)
+		}
+	}
+
+	// If nothing matched and we already have a non-empty prefix,
+	// the filename ends here; try extension discovery.
+	if !anyMatch && len(file) > 0 {
+		files = append(files, de.enumerateExtension(ctx, baseURL, file, tilde, "", extChars, detResult)...)
+	}
+
+	return files
+}
+
+// enumerateExtension recursively builds the 8.3 extension (up to MaxExtensionLen chars).
+// If no extension chars match, the file is recorded without an extension.
+func (de *DetectionEngine) enumerateExtension(
+	ctx context.Context,
+	baseURL, file, tilde, ext, extChars string,
+	detResult *DetectionResult,
+) []FileInfo {
+	files := make([]FileInfo, 0)
+	anyMatch := false
+
+	for _, char := range []rune(extChars) {
+		newExt := ext + string(char)
+		// IIS pattern: FILE~N.EXT* — does the file have an extension starting with newExt?
+		testURL := fmt.Sprintf("%s%s%s.%s*", baseURL, file, tilde, newExt)
+
+		resp, err := de.httpEngine.Request(ctx, detResult.Method, testURL, nil)
+		if err != nil {
+			continue
+		}
+		drainAndClose(resp.Body)
+		if resp.StatusCode == detResult.StatusNeg {
 			continue
 		}
 
-		// Continue recursion within IIS 8.3 limits:
-		//   file prefix ≤ MaxFilenameLen, extension ≤ MaxExtensionLen.
-		fileWithinLimit := !inExtMode && len(newFile) < config.MaxFilenameLen
-		extWithinLimit := inExtMode && len(newExt) < config.MaxExtensionLen
-		if fileWithinLimit || extWithinLimit {
-			deeper := de.enumerateRecursive(ctx, baseURL, newFile, tilde, newExt, fileChars, extChars, detResult)
-			files = append(files, deeper...)
+		anyMatch = true
+
+		if len(newExt) < config.MaxExtensionLen {
+			deeper := de.enumerateExtension(ctx, baseURL, file, tilde, newExt, extChars, detResult)
+			if len(deeper) > 0 {
+				files = append(files, deeper...)
+			} else {
+				// No char extends ext further → extension complete at newExt.
+				files = append(files, de.makeFileInfo(baseURL, file, tilde, "."+newExt))
+			}
+		} else {
+			// Reached MaxExtensionLen.
+			files = append(files, de.makeFileInfo(baseURL, file, tilde, "."+newExt))
+		}
+	}
+
+	// Extension enumeration complete (or was called with empty ext meaning "no matches").
+	if !anyMatch {
+		if len(ext) > 0 {
+			// Partial ext that couldn't be extended → record as-is.
+			files = append(files, de.makeFileInfo(baseURL, file, tilde, "."+ext))
+		} else {
+			// No extension at all — record file without extension.
+			files = append(files, de.makeFileInfo(baseURL, file, tilde, ""))
 		}
 	}
 
 	return files
 }
 
-// isCompleteFile verifies that a specific short name without wildcards returns a hit.
-func (de *DetectionEngine) isCompleteFile(ctx context.Context, baseURL, file, tilde, ext string, detResult *DetectionResult) bool {
-	testURL := fmt.Sprintf("%s%s%s%s", baseURL, file, tilde, ext)
-	resp, err := de.httpEngine.Request(ctx, detResult.Method, testURL, nil)
-	if err != nil {
-		return false
+// enumerateRecursive is the public entry point kept for API compatibility.
+// It dispatches to enumerateFileName (ext=="") or enumerateExtension (ext!="").
+func (de *DetectionEngine) enumerateRecursive(
+	ctx context.Context,
+	baseURL, file, tilde, ext, fileChars, extChars string,
+	detResult *DetectionResult,
+) []FileInfo {
+	if ext != "" {
+		return de.enumerateExtension(ctx, baseURL, file, tilde, ext, extChars, detResult)
 	}
-	drainAndClose(resp.Body)
-	return resp.StatusCode != detResult.StatusNeg
+	return de.enumerateFileName(ctx, baseURL, file, tilde, fileChars, extChars, detResult)
+}
+
+// makeFileInfo constructs a FileInfo for a discovered short filename.
+func (de *DetectionEngine) makeFileInfo(baseURL, file, tilde, ext string) FileInfo {
+	return FileInfo{
+		ShortName:     file + tilde + ext,
+		BaseURL:       baseURL,
+		Tilde:         tilde,
+		Extension:     ext,
+		DiscoveryTime: time.Now(),
+		Confidence:    0.95,
+	}
 }
 
 // FuzzyMatch returns the similarity score (0.0–1.0) between two response bodies.
