@@ -22,8 +22,11 @@ import (
 
 // DetectionResult represents the result of a vulnerability detection pass.
 type DetectionResult struct {
-	Vulnerable    bool          `json:"vulnerable"`
-	Confidence    float64       `json:"confidence"`
+	Vulnerable bool    `json:"vulnerable"`
+	Confidence float64 `json:"confidence"`
+	// DetectionMode is the algorithm used (e.g. "status", "method").
+	DetectionMode string `json:"detection_mode"`
+	// Method is the HTTP method (verb) that triggered the vulnerability (e.g. "OPTIONS").
 	Method        string        `json:"method"`
 	StatusPos     int           `json:"status_pos"`
 	StatusNeg     int           `json:"status_neg"`
@@ -170,7 +173,7 @@ func (de *DetectionEngine) DetectVulnerability(ctx context.Context, baseURL stri
 	if mode == config.DetectionAuto {
 		mode = de.autoSelectMode(ctx, baseURL)
 	}
-	result.Method = string(mode)
+	result.DetectionMode = string(mode)
 
 	// Determine patience level: higher patience → more path/method combinations.
 	pathCount := 4
@@ -200,6 +203,9 @@ outerLoop:
 				result.StatusPos = statusPos
 				result.StatusNeg = statusNeg
 				result.Confidence = 0.9
+				// Store the actual HTTP verb that worked so enumeration
+				// can reuse it instead of using the detection mode name.
+				result.Method = method
 
 				if de.cfg.VulnCheckOnly {
 					break outerLoop
